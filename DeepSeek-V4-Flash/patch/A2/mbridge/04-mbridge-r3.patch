@@ -1,0 +1,42 @@
+# =============================================================================
+# R3 FINAL · 04-mbridge.patch · mbridge（每仓一个补丁）
+# 目标：mbridge v0.15.1（/home/tiger/mbridge）
+# 前置：无
+# 合并来源（单补丁，仅在文件头追加注释）：
+#   1) 04-mbridge.patch                             tid2eid hash 路由表映射与 dtype 保留
+# 详细背景与验收标准见 dsv4_r3_issue.md §11 / §12。
+# =============================================================================
+
+# ---- [1/1] 04-mbridge.patch ----
+# R3 / Routing Replay router-field patch for mbridge v0.15.1
+# Target: mbridge v0.15.1 (HEAD) + current working tree (DeepseekV4Bridge)
+# Apply order: 01-verl -> 03-megatron-lm -> 02-mindspeed-llm -> 04 (this) -> 05-vllm -> 06-vllm-ascend
+# Scope: map/preserve the tid2eid hash routing table (default: disabled at runtime).
+
+diff --git a/mbridge/models/deepseek_v3.py b/mbridge/models/deepseek_v3.py
+index 478798d..41f7982 100644
+--- a/mbridge/models/deepseek_v3.py
++++ b/mbridge/models/deepseek_v3.py
+@@ -46,6 +46,9 @@ class DeepseekV3Bridge(LLMBridge):
+             "model.layers.{layer_number}.post_attention_layernorm.weight"
+         ],
+         "mlp.router.weight": ["model.layers.{layer_number}.mlp.gate.weight"],
++        "mlp.router.tid2eid": [
++            "layers.{layer_number}.ffn.gate.tid2eid"
++        ],
+         "mlp.router.expert_bias": [
+             "model.layers.{layer_number}.mlp.gate.e_score_correction_bias"
+         ],
+@@ -101,6 +104,12 @@ class DeepseekV3Bridge(LLMBridge):
+ 
+     TransformerConfigClass = MLATransformerConfig
+ 
++    def _preserve_hf_dtype(self, mcore_weights_name: str) -> bool:
++        # tid2eid is an integer routing table and must not be cast to model dtype.
++        return "tid2eid" in mcore_weights_name or super()._preserve_hf_dtype(
++            mcore_weights_name
++        )
++
+     def _build_config(self):
+         hf_config = self.hf_config
+         mla_rope_config = {

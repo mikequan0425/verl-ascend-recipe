@@ -1,0 +1,152 @@
+# =============================================================================
+# R3 FINAL · 05-vllm.patch · vLLM（每仓一个补丁）
+# 目标：vLLM v0.26.0 @568afb3（/home/tiger/vllm）
+# 前置：无
+# 合并来源（按序拼接，实测与逐个 apply 结果逐字节一致）：
+#   1) 05-vllm.patch                                RoutedExpertsManager 压缩 KV span / padding slot
+#   2) 29-vllm-capture-slot-len-guard.patch         get() 槽位不足 fail-fast（修 P4 的静默截断）
+# 详细背景与验收标准见 dsv4_r3_issue.md §11 / §12。
+# =============================================================================
+
+# ---- [1/2] 05-vllm.patch ----
+# R3 / Routing Replay capture patch for vLLM v0.26.0 (568afb3)
+# Target: vLLM v0.26.0
+# Apply order: 01-verl -> 03-megatron-lm -> 02-mindspeed-llm -> 04-mbridge -> 05 (this) -> 06-vllm-ascend
+# Scope: UniformTypeKVCacheSpecs unwrap, compress_ratio slot span, padding-slot mask.
+
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+index 115f43a..8cf94a2 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+@@ -14,7 +14,11 @@ from vllm.config import VllmConfig
+ from vllm.distributed.parallel_state import get_tp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.platforms import current_platform
+-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    UniformTypeKVCacheSpecs,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -250,19 +254,35 @@ class RoutedExpertsManager:
+         vllm_config: VllmConfig,
+         kv_cache_config: KVCacheConfig,
+     ) -> None:
+-        # Pick the attention group for block/slot mapping. We require
+-        # a FullAttentionSpec group rather than any AttentionSpec to
+-        # stay consistent with the worker-side lookup in
+-        # ``GPUModelRunner._get_attention_kv_cache_gid``; hybrid models
+-        # (Mamba / linear attention) also have other AttentionSpec
+-        # groups whose slot layout differs.
++        # Pick the attention group for block/slot mapping. Unwrap
++        # UniformTypeKVCacheSpecs first: hybrid models (e.g. DeepSeek-V4
++        # on vllm-ascend) group per-layer specs into UniformTypeKVCacheSpecs,
++        # which is not itself a FullAttentionSpec.
++        def _unwrap(spec):
++            if isinstance(spec, UniformTypeKVCacheSpecs):
++                return next(iter(spec.kv_cache_specs.values()))
++            return spec
++
+         self.attn_gid = next(
+             gid
+             for gid, g in enumerate(kv_cache_config.kv_cache_groups)
+-            if isinstance(g.kv_cache_spec, FullAttentionSpec)
++            if isinstance(_unwrap(g.kv_cache_spec), FullAttentionSpec)
++        )
++        attn_spec = _unwrap(
++            kv_cache_config.kv_cache_groups[self.attn_gid].kv_cache_spec
+         )
+-        attn_group = kv_cache_config.kv_cache_groups[self.attn_gid]
+-        self.block_size = attn_group.kv_cache_spec.block_size
++        self.block_size = attn_spec.block_size
++
++        # KV compression (e.g. DeepSeek-V4 sparse MLA on vllm-ascend):
++        # the KV manager allocates one block per ``block_size`` *compressed*
++        # tokens, i.e. one block spans ``block_size * compress_ratio``
++        # logical tokens. The slot buffer keeps one slot per *logical*
++        # token by expanding the slot space:
++        #     slot = block_id * block_span + pos % block_span
++        # For uncompressed models block_span == block_size, reducing to
++        # the original layout.
++        self.compress_ratio = getattr(attn_spec, "compress_ratio", 1)
++        self.block_span = self.block_size * self.compress_ratio
+ 
+         # All kv_cache_groups share the same physical block pool, so
+         # block IDs span [0, num_blocks) regardless of how many groups
+@@ -271,7 +291,7 @@ class RoutedExpertsManager:
+         hf_config = vllm_config.model_config.hf_text_config
+         num_experts = get_num_experts(hf_config)
+         num_experts_per_tok = _get_num_experts_per_tok(hf_config)
+-        max_num_slots = kv_cache_config.num_blocks * self.block_size
++        max_num_slots = kv_cache_config.num_blocks * self.block_span
+         # Expert IDs are 0..num_experts-1; uint8 fits 256 distinct
+         # values so the boundary is ``<= 256`` (NOT ``< 256``). Keeping
+         # this narrow matters because the slot buffer is sized for the
+@@ -300,9 +320,12 @@ class RoutedExpertsManager:
+ 
+         Equivalent to ``slot_buffer[slot_mapping] = data``; numpy fancy
+         indexing handles repeated / out-of-order indices. Called once
+-        per scheduler step in ``update_from_output``.
++        per scheduler step in ``update_from_output``. Slots with id -1
++        are padding and must be skipped (numpy would wrap -1 to the
++        last row and silently corrupt it).
+         """
+-        self.routed_experts_by_slot[slot_mapping] = data
++        mask = slot_mapping >= 0
++        self.routed_experts_by_slot[slot_mapping[mask]] = data[mask]
+ 
+     def get(
+         self,
+@@ -335,15 +358,16 @@ class RoutedExpertsManager:
+             Array of shape (num_tokens - token_start, num_layers,
+             num_experts_per_tok).
+         """
+-        bs = self.block_size
+-        block_ids_array = np.array(block_ids, dtype=np.int32)
+-        block_offsets = np.arange(bs)
+-        # slot = block_id * block_size + offset_in_block; flatten the
+-        # (num_blocks, block_size) grid and trim to num_tokens, then
+-        # skip the first token_start entries so only the requested
+-        # range is fetched in a single fancy-index read.
++        span = self.block_span
++        block_ids_array = np.array(block_ids, dtype=np.int64)
++        block_offsets = np.arange(span)
++        # slot = block_id * block_span + offset_in_block. With KV
++        # compression one block covers block_span logical tokens (the
++        # kv manager allocates blocks on compressed tokens), so this
++        # linear reconstruction stays correct provided ``block_ids``
++        # are the kv-manager block ids of the group the worker used.
+         slot_mapping = (
+-            block_ids_array.reshape(-1, 1) * bs + block_offsets.reshape(1, -1)
++            block_ids_array.reshape(-1, 1) * span + block_offsets.reshape(1, -1)
+         ).flatten()[:num_tokens]
+         slot_mapping = slot_mapping[token_start:]
+         return self.routed_experts_by_slot[slot_mapping]
+
+# ---- [2/2] 29-vllm-capture-slot-len-guard.patch ----
+# 修复 29：RoutedExpertsManager.get() 增加槽位长度断言（fail-fast）
+# 依赖：06_r3/05-vllm
+# 问题：block 表覆盖的槽位少于 num_tokens 时，下面的 [:num_tokens] 会静默返回更少的行，
+#   下游 as_dict() 左对齐补零后整条 response 路由左移，精度崩坏但全程无报错。
+# 修复：短了就抛 RuntimeError，把"少块"暴露在第一现场（28 修好后不会触发）。
+#
+--- a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+@@ -396,6 +396,14 @@
+         span = self.block_span
+         block_ids_array = np.array(block_ids, dtype=np.int64)
+         block_offsets = np.arange(span)
++        # R3 fix 29: fail fast instead of silently truncating below. A short
++        # block table shifts every following token's routes by one or more rows.
++        _r3_slots = int(len(block_ids)) * int(block_offsets.shape[0])
++        if _r3_slots < num_tokens:
++            raise RuntimeError(
++                f"RoutedExpertsManager.get: {len(block_ids)} blocks x span {span} = "
++                f"{_r3_slots} slots < num_tokens={num_tokens}"
++            )
+         # slot = block_id * block_span + offset_in_block. With KV
+         # compression one block covers block_span logical tokens (the
+         # kv manager allocates blocks on compressed tokens), so this

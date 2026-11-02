@@ -1,0 +1,285 @@
+# =============================================================================
+# R3 FINAL · 06-vllm-ascend.patch · vllm-ascend（每仓一个补丁）
+# 目标：vllm-ascend releases/v0.26.0rc（/home/tiger/vllm-ascend）
+# 前置：无
+# 合并来源（按序拼接；三个补丁分别落在 4 个不同文件，无 hunk 重叠）：
+#   1) 06-vllm-ascend.patch                         track raw kv-manager block ids，重建 routed-experts slot
+#   2) 13-vllm-ascend-capture-gate-fix.patch        去掉错误的 config gate、layer_id 取法（修 P1）
+#   3) 28-vllm-ascend-cdiv-kv-blocks.patch          压缩 KV 块分配 // → cdiv（修 P4，核心）
+# 详细背景与验收标准见 dsv4_r3_issue.md §11 / §12。
+# =============================================================================
+
+# ---- [1/3] 06-vllm-ascend.patch ----
+# R3 / Routing Replay capture patch for vllm-ascend releases/v0.26.0rc (e0bd2501f)
+# Target: vllm-ascend releases/v0.26.0rc
+# Apply order: 01-verl -> 03-megatron-lm -> 02-mindspeed-llm -> 04-mbridge -> 05-vllm -> 06 (this)
+# Scope: track raw kv-manager block ids and rebuild routed-experts slot mapping for compressed KV.
+
+diff --git a/vllm_ascend/worker/block_table.py b/vllm_ascend/worker/block_table.py
+index 07c9f816a..a4011b8d8 100644
+--- a/vllm_ascend/worker/block_table.py
++++ b/vllm_ascend/worker/block_table.py
+@@ -53,6 +53,7 @@ class BlockTable:
+         self.pin_memory = pin_memory
+         self.device = device
+         self.physical_block_size = block_size
++        self.compress_ratio = compress_ratio
+         self.is_mamba_group = (
+             kv_cache_group is not None
+             and hasattr(kv_cache_group, "kv_cache_spec")
+@@ -105,6 +106,17 @@ class BlockTable:
+             dtype=torch.int32,
+         )
+ 
++        # Track the raw (kv-manager view) block ids for compressed groups.
++        # ``self.block_table`` stores logical (kernel) block ids after
++        # hybrid-block expansion, while routed-experts slot reconstruction
++        # needs the un-expanded kv-manager block ids.
++        self.track_raw_block_ids = compress_ratio > 1
++        if self.track_raw_block_ids:
++            self.raw_block_ids = np.zeros(
++                (max_num_reqs, self.max_num_blocks_per_req), dtype=np.int32
++            )
++            self.raw_num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
++
+         self.kernel_sizes = kernel_sizes
+         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+ 
+@@ -116,6 +128,11 @@ class BlockTable:
+         if not block_ids:
+             return
+         block_ids = np.array(block_ids)
++        if self.track_raw_block_ids:
++            raw_start = self.raw_num_blocks_per_row[row_idx]
++            num_raw = len(block_ids)
++            self.raw_block_ids[row_idx, raw_start : raw_start + num_raw] = block_ids
++            self.raw_num_blocks_per_row[row_idx] += num_raw
+         if self.use_hybrid_blocks:
+             block_ids = self._convert_physical_to_logical_blocks(block_ids)
+ 
+@@ -127,6 +144,8 @@ class BlockTable:
+ 
+     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+         self.num_blocks_per_row[row_idx] = 0
++        if self.track_raw_block_ids:
++            self.raw_num_blocks_per_row[row_idx] = 0
+         self.append_row(block_ids, row_idx)
+ 
+     def clear_row(self, row_idx: int) -> None:
+@@ -134,11 +153,20 @@ class BlockTable:
+         if num_blocks > 0:
+             self.block_table.np[row_idx, :num_blocks] = 0
+         self.num_blocks_per_row[row_idx] = 0
++        if self.track_raw_block_ids:
++            raw_blocks = self.raw_num_blocks_per_row[row_idx]
++            if raw_blocks > 0:
++                self.raw_block_ids[row_idx, :raw_blocks] = 0
++            self.raw_num_blocks_per_row[row_idx] = 0
+ 
+     def move_row(self, src: int, tgt: int) -> None:
+         num_blocks = self.num_blocks_per_row[src]
+         self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
+         self.num_blocks_per_row[tgt] = num_blocks
++        if self.track_raw_block_ids:
++            raw_blocks = self.raw_num_blocks_per_row[src]
++            self.raw_block_ids[tgt, :raw_blocks] = self.raw_block_ids[src, :raw_blocks]
++            self.raw_num_blocks_per_row[tgt] = raw_blocks
+ 
+     def swap_row(self, src: int, tgt: int) -> None:
+         num_blocks_src = self.num_blocks_per_row[src]
+@@ -148,6 +176,13 @@ class BlockTable:
+ 
+         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
+ 
++        if self.track_raw_block_ids:
++            raw_src = self.raw_num_blocks_per_row[src]
++            raw_tgt = self.raw_num_blocks_per_row[tgt]
++            self.raw_num_blocks_per_row[src] = raw_tgt
++            self.raw_num_blocks_per_row[tgt] = raw_src
++            self.raw_block_ids[[src, tgt]] = self.raw_block_ids[[tgt, src]]
++
+     def compute_slot_mapping(
+         self,
+         num_reqs: int,
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 85879e803..70dd32fc7 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -2052,6 +2052,39 @@ class NPUModelRunner(GPUModelRunner):
+                         out=dsa_positions_np,
+                     )
+ 
++                    # Routed experts: rebuild the per-logical-token
++                    # slot_mapping from kv-manager block ids. The compressed
++                    # group's attention slot_mapping is expressed on
++                    # compressed blocks and cannot index per-token routing
++                    # data. Slot layout must match RoutedExpertsManager:
++                    #   slot = block_id * block_span + pos % block_span
++                    # with block_span = block_size * compress_ratio.
++                    if (
++                        self.model_config.enable_return_routed_experts
++                        and self.routed_experts_initialized
++                    ):
++                        c4_block_table = self.input_batch.block_table[0]
++                        if c4_block_table.track_raw_block_ids:
++                            block_span = (
++                                c4_block_table.physical_block_size
++                                * c4_block_table.compress_ratio
++                            )
++                            block_idx = np.clip(
++                                dsa_positions_np // block_span,
++                                0,
++                                c4_block_table.raw_block_ids.shape[1] - 1,
++                            )
++                            re_slot_mapping_np = (
++                                c4_block_table.raw_block_ids[
++                                    req_indices, block_idx
++                                ].astype(np.int64)
++                                * block_span
++                                + dsa_positions_np % block_span
++                            )
++                            self.routed_experts_slot_mapping_device[
++                                :total_num_scheduled_tokens
++                            ].copy_(torch.from_numpy(re_slot_mapping_np))
++
+                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+ 
+@@ -3085,13 +3118,21 @@ class NPUModelRunner(GPUModelRunner):
+                 blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+             if self.model_config.enable_return_routed_experts and kv_cache_gid == 0:
+                 if self.routed_experts_initialized:
+-                    # snapshot slot_mapping into a private device
+-                    # buffer so the next ``_prepare_inputs`` does not
+-                    # overwrite it while D2H is still pending.
+-                    n = slot_mapping.shape[0]
+-                    self.routed_experts_slot_mapping_device[:n].copy_(
+-                        slot_mapping
+-                    )
++                    # For compressed groups the routed-experts slot_mapping
++                    # was already rebuilt from kv-manager block ids in
++                    # ``_prepare_inputs``; the attention slot_mapping here
++                    # is compressed-block based and must not overwrite it.
++                    blk_table = self.input_batch.block_table[kv_cache_gid]
++                    if not (
++                        self.use_compress and blk_table.track_raw_block_ids
++                    ):
++                        # snapshot slot_mapping into a private device
++                        # buffer so the next ``_prepare_inputs`` does not
++                        # overwrite it while D2H is still pending.
++                        n = slot_mapping.shape[0]
++                        self.routed_experts_slot_mapping_device[:n].copy_(
++                            slot_mapping
++                        )
+             return blk_table_tensor, slot_mapping
+ 
+         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+
+# ---- [2/3] 13-vllm-ascend-capture-gate-fix.patch ----
+# R3 capture fix for vllm-ascend (vLLM v0.26.0rc / vllm-ascend releases/v0.26.0rc).
+# Symptom: every RoutedExpertsManager.store_batch saw nonzero=0 -> the worker
+# never wrote routing ids, so R3 replayed "everything to expert 0".
+# Root cause: the capture call site gates on get_current_vllm_config(); that
+# global is not installed while the worker executes the forward pass, so
+# model_config is None and capture() is skipped silently. The gate is also
+# wrong on its own: a bound capturer already implies
+# enable_return_routed_experts=True (binding happens only inside
+# init_routed_experts_capturer(), which runs under that flag).
+# Secondary bug fixed here: `layer` is self.routed_experts (RoutedExperts),
+# which has no `layer_id` property -- as soon as capture is reached,
+# `layer.layer_id` would raise AttributeError. Derive the layer index from
+# `layer.layer_name` instead.
+# Probe (default off): VERL_R3_PROBE_CAPTURE_ASCEND=1 -> [R3CAPA] one-shot lines.
+#
+diff --git a/vllm_ascend/ops/fused_moe/fused_moe.py b/vllm_ascend/ops/fused_moe/fused_moe.py
+--- a/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -213,15 +213,41 @@
+             num_experts=num_logical_experts,
+             tid2eid=self.tid2eid,
+             input_ids=input_ids,
+         )
+         try:
+             _vllm_config = get_current_vllm_config()
+         except AssertionError:
+             _vllm_config = None
+         model_config = None if _vllm_config is None else _vllm_config.model_config
+-        if model_config is not None and model_config.enable_return_routed_experts:
+-            capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
+-            if capturer is not None:
+-                capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
++        # R3 capture: do NOT gate on ``get_current_vllm_config()``. The global
++        # config is not guaranteed to be installed while the worker executes
++        # the forward pass, which silently skipped capture and left every
++        # captured slot at zero. A bound capturer already implies
++        # ``enable_return_routed_experts=True``.
++        capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
++        try:
++            import os as _r3_os
++
++            if _r3_os.environ.get("VERL_R3_PROBE_CAPTURE_ASCEND", "0") == "1":
++                _r3_left = getattr(type(self).apply, "_r3cap_left", 8)
++                if _r3_left > 0:
++                    type(self).apply._r3cap_left = _r3_left - 1
++                    print(
++                        f"[R3CAPA] layer={getattr(layer, 'layer_name', '?')} "
++                        f"capturer={'bound' if capturer is not None else 'None'} "
++                        f"model_config={'None' if model_config is None else model_config.enable_return_routed_experts} "
++                        f"topk={tuple(topk_ids.shape)} "
++                        f"topk_nz={int((topk_ids != 0).sum().item())}",
++                        flush=True,
++                    )
++        except Exception as _r3_exc:  # probe must never break the hot path
++            print(f"[R3CAPA] probe failed: {_r3_exc}", flush=True)
++        if capturer is not None:
++            _r3_layer_id = getattr(layer, "layer_id", None)
++            if _r3_layer_id is None:
++                from vllm.model_executor.models.utils import extract_layer_index
++
++                _r3_layer_id = extract_layer_index(layer.layer_name)
++            capturer.capture(layer_id=_r3_layer_id, topk_ids=topk_ids)
+ 
+         if zero_expert_num > 0 and zero_expert_type is not None:
+             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
+
+# ---- [3/3] 28-vllm-ascend-cdiv-kv-blocks.patch ----
+# 正式修复 28（核心）：CompressAttentionManager 块分配向下取整 -> 向上取整
+# 依赖：06_r3/06-vllm-ascend（同仓库）
+# 根因：路由槽位按逻辑位置寻址 block_ids[p // 128] * 128 + p % 128，覆盖 p 个 token
+#   需要 cdiv(p, compress_ratio) 个压缩 token；原实现用 num_tokens // compress_ratio，
+#   当 num_tokens % 128 属于 {1,2,3} 时少分配 1 个 block：
+#   - Worker 侧 raw_block_ids[req, k] == 0 -> 路由写进 block 0(null block)
+#   - Scheduler 侧 get() 读到后分配、从未写入的 block -> 全 0 且静默截断
+#   - as_dict() 左对齐补零 -> 整条 response 路由左移 1~2 个 token
+# 证据：train10291135.log [R3CAPV] store slot=[0,255] / get slot=[128,13570]，out_nonzero
+#   少 72 = 3 行 x 4 层 x 6；train10290248.log [R3CAP] raw=2303 vs out=2305；全部 R3 run
+#   的 rollout_rs_token_k1_seq_fraction_high 恒为 0.015625(=1/64)，R3 off 为 0
+# 安全性：admission cap 已是 cdiv(max_model_len // compress_ratio, block_size) + 1，
+#   提前 1 个 token 分配不会超出池；注意力侧按 metadata.num_compressed_tokens 写入，透明。
+#
+--- a/vllm_ascend/core/single_type_kv_cache_manager.py
++++ b/vllm_ascend/core/single_type_kv_cache_manager.py
+@@ -48,8 +48,10 @@
+         # assert isinstance(self.kv_cache_spec, (CompressAttentionSpec, C4IndexerSpec))
+ 
+-        num_tokens //= self.compress_ratio
++        # R3 fix 28: round up. A logical token position p maps to block p // 128,
++        # so covering p tokens needs cdiv(p, compress_ratio) compressed tokens.
++        num_tokens = cdiv(num_tokens, self.compress_ratio)
+         if num_tokens_main_model is None:
+             assert num_local_computed_tokens is not None
+             num_tokens_main_model = num_local_computed_tokens
+-        num_tokens_main_model //= self.compress_ratio
++        num_tokens_main_model = cdiv(num_tokens_main_model, self.compress_ratio)
+         return super().get_num_blocks_to_allocate(
+@@ -146,7 +148,8 @@
+             The new allocated blocks.
+         """
+-        num_tokens //= self.compress_ratio
++        # R3 fix 28: same rounding rule as get_num_blocks_to_allocate.
++        num_tokens = cdiv(num_tokens, self.compress_ratio)
+         ## TODO: check spec decode
+-        num_tokens_main_model //= self.compress_ratio
++        num_tokens_main_model = cdiv(num_tokens_main_model, self.compress_ratio)
+ 
+         req_blocks = self.req_to_blocks[request_id]
