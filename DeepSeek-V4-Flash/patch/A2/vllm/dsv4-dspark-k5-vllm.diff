@@ -1,0 +1,13 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1476,7 +1476,8 @@
+                         # Default to max value defined in draft model config.
+                         self.num_speculative_tokens = n_predict
+                     elif (
+-                        self.num_speculative_tokens > n_predict
++                        self.method != "dspark"
++                        and self.num_speculative_tokens > n_predict
+                         and self.num_speculative_tokens % n_predict != 0
+                     ):
+                         # Ensure divisibility for MTP module reuse.

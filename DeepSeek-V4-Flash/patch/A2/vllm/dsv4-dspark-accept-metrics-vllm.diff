@@ -1,0 +1,58 @@
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1963,17 +1963,29 @@
+         return not self.has_work()
+ 
+     def _send_finish_outputs_to_client(
+-        self, req_ids: list[str], client_index: int, finish_reason: FinishReason
++        self,
++        req_ids: list[str] | list[Request],
++        client_index: int,
++        finish_reason: FinishReason,
+     ) -> None:
+         outputs = [
+-            EngineCoreOutput(req_id, [], finish_reason=finish_reason)
+-            for req_id in req_ids
++            EngineCoreOutput(
++                request if isinstance(request, str) else request.request_id,
++                [],
++                finish_reason=finish_reason,
++                spec_decode_metrics=(
++                    None if isinstance(request, str) else request.spec_decode_metrics
++                ),
++            )
++            for request in req_ids
+         ]
+-        eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)
++        eco = EngineCoreOutputs(
++            finished_requests=[output.request_id for output in outputs], outputs=outputs
++        )
+         self.output_queue.put_nowait((client_index, eco))
+ 
+     def _send_abort_outputs_to_client(
+-        self, req_ids: list[str], client_index: int
++        self, req_ids: list[str] | list[Request], client_index: int
+     ) -> None:
+         self._send_finish_outputs_to_client(req_ids, client_index, FinishReason.ABORT)
+ 
+@@ -1985,12 +1997,14 @@
+     def _send_abort_outputs(self, aborted_reqs: list[Request]) -> None:
+         # TODO(nick) this will be moved inside the scheduler
+         if aborted_reqs:
+-            # Map client_index to list of request_ids that belong to that client.
+-            by_client = defaultdict[int, set[str]](set)
++            # Retain requests so abort outputs include their cumulative metrics.
++            by_client = defaultdict[int, dict[str, Request]](dict)
+             for request in aborted_reqs:
+-                by_client[request.client_index].add(request.request_id)
+-            for client_index, req_ids in by_client.items():
+-                self._send_abort_outputs_to_client(list(req_ids), client_index)
++                by_client[request.client_index][request.request_id] = request
++            for client_index, requests in by_client.items():
++                self._send_abort_outputs_to_client(
++                    list(requests.values()), client_index
++                )
+ 
+ 
+ class DPEngineCoreProc(EngineCoreProc):
